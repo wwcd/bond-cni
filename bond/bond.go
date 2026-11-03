@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"runtime"
 	"strconv"
 
@@ -30,6 +31,7 @@ import (
 	"github.com/containernetworking/plugins/pkg/ipam"
 	"github.com/containernetworking/plugins/pkg/netlinksafe"
 	"github.com/containernetworking/plugins/pkg/ns"
+	"github.com/containernetworking/plugins/pkg/utils/sysctl"
 	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netns"
 
@@ -392,6 +394,27 @@ func cmdAdd(args *skel.CmdArgs) error {
 		result.Routes = ipamResult.Routes
 
 		err = netns.Do(func(_ ns.NetNS) error {
+			// Enable gratuitous ARP and IPv6 Neighbor Advertisement notifications so peers
+			// update neighbor caches when an IP moves to a new MAC. Errors are logged and
+			// ignored so IPv4-only or IPv6-disabled kernels do not fail pod creation.
+			if _, err := sysctl.Sysctl(fmt.Sprintf("net/ipv4/conf/%s/arp_notify", args.IfName), "1"); err != nil {
+				_, _ = fmt.Fprintf(os.Stderr, "bond-cni: failed to enable arp_notify: %v\n", err)
+			}
+			if _, err := sysctl.Sysctl(fmt.Sprintf("net/ipv6/conf/%s/ndisc_notify", args.IfName), "1"); err != nil {
+				_, _ = fmt.Fprintf(os.Stderr, "bond-cni: failed to enable ndisc_notify (IPv6 may be disabled): %v\n", err)
+			}
+
+			// Bring the bond link down before configuring the IP address so that GARP/NA
+			// notifications are triggered when ipam.ConfigureIface brings the link back up.
+			link, err := netlinksafe.LinkByName(args.IfName)
+			if err != nil {
+				return fmt.Errorf("bond-cni: failed to lookup %q: %v", args.IfName, err)
+			}
+			err = netlink.LinkSetDown(link)
+			if err != nil {
+				return fmt.Errorf("bond-cni: failed to set link %q down: %v", args.IfName, err)
+			}
+
 			return ipam.ConfigureIface(args.IfName, result)
 		})
 		if err != nil {

@@ -16,6 +16,8 @@ package main
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"strconv"
 
 	"github.com/containernetworking/cni/pkg/skel"
@@ -23,10 +25,10 @@ import (
 	types020 "github.com/containernetworking/cni/pkg/types/020"
 	types040 "github.com/containernetworking/cni/pkg/types/040"
 	types100 "github.com/containernetworking/cni/pkg/types/100"
-
 	"github.com/containernetworking/plugins/pkg/netlinksafe"
 	"github.com/containernetworking/plugins/pkg/ns"
 	"github.com/containernetworking/plugins/pkg/testutils"
+	"github.com/containernetworking/plugins/pkg/utils/sysctl"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/vishvananda/netlink"
@@ -741,6 +743,94 @@ var _ = Describe("bond plugin", func() {
 					Expect(err).NotTo(HaveOccurred())
 				}
 				return nil
+			})
+			Expect(err).NotTo(HaveOccurred())
+		})
+	})
+
+	When("IPAM is configured", func() {
+		BeforeEach(func() {
+			var err error
+
+			podNS, err = testutils.NewNS()
+			Expect(err).NotTo(HaveOccurred())
+
+			err = podNS.Do(func(ns.NetNS) error {
+				defer GinkgoRecover()
+				_, err := sysctl.Sysctl("net/ipv6/conf/all/disable_ipv6", "0")
+				Expect(err).NotTo(HaveOccurred())
+				_, err = sysctl.Sysctl("net/ipv6/conf/default/disable_ipv6", "0")
+				Expect(err).NotTo(HaveOccurred())
+				return nil
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			linkAttrs := []netlink.LinkAttrs{
+				{Name: Slave1},
+				{Name: Slave2},
+			}
+			addLinksInNS(podNS, linkAttrs)
+
+			ipamDir := GinkgoT().TempDir()
+			mockIPAM := filepath.Join(ipamDir, "mock-ipam")
+			script := "#!/bin/sh\nif [ \"$CNI_COMMAND\" = \"ADD\" ]; then\n  printf '%s\\n' '{\"cniVersion\":\"1.0.0\",\"ips\":[{\"address\":\"10.1.2.2/24\"},{\"address\":\"fd00::2/64\"}]}'\nfi\n"
+			Expect(os.WriteFile(mockIPAM, []byte(script), 0o755)).To(Succeed())
+			GinkgoT().Setenv("PATH", ipamDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+		})
+
+		It("enables arp_notify and ndisc_notify on the bond interface", func() {
+			config := `{
+				"name": "bond",
+				"type": "bond",
+				"cniVersion": "1.0.0",
+				"mode": "active-backup",
+				"failOverMac": 1,
+				"linksInContainer": true,
+				"miimon": "100",
+				"mtu": 1400,
+				"links": [
+					{"name": "net1"},
+					{"name": "net2"}
+				],
+				"ipam": {
+					"type": "mock-ipam"
+				}
+			}`
+			args = &skel.CmdArgs{
+				ContainerID: "dummy",
+				Netns:       podNS.Path(),
+				IfName:      IfName,
+				StdinData:   []byte(config),
+			}
+
+			By("creating the bond interface with IPAM")
+			r, _, err := testutils.CmdAddWithArgs(args, func() error {
+				return cmdAdd(args)
+			})
+			Expect(err).NotTo(HaveOccurred())
+			checkAddReturnResult(&r, IfName)
+
+			result100, err := types100.NewResultFromResult(r)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result100.IPs).To(HaveLen(2))
+
+			By("verifying arp_notify and ndisc_notify sysctls are enabled")
+			err = podNS.Do(func(ns.NetNS) error {
+				defer GinkgoRecover()
+				arpNotify, err := sysctl.Sysctl(fmt.Sprintf("net/ipv4/conf/%s/arp_notify", IfName))
+				Expect(err).NotTo(HaveOccurred())
+				Expect(arpNotify).To(Equal("1"))
+
+				ndiscNotify, err := sysctl.Sysctl(fmt.Sprintf("net/ipv6/conf/%s/ndisc_notify", IfName))
+				Expect(err).NotTo(HaveOccurred())
+				Expect(ndiscNotify).To(Equal("1"))
+				return nil
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("deleting the bond interface with IPAM")
+			err = testutils.CmdDelWithArgs(args, func() error {
+				return cmdDel(args)
 			})
 			Expect(err).NotTo(HaveOccurred())
 		})
